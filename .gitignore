@@ -1,0 +1,11 @@
+# Supabase
+.branches
+.temp
+supabase/.temp
+
+# IDE
+.vscode
+.idea
+
+# OS
+.DS_Store
