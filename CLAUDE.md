@@ -1,6 +1,6 @@
 # Clean Signal — Supabase Backend
 
-Barcode nutrition lookup app. Scan a food barcode → get nutritional info from Open Food Facts, cached in Supabase.
+Barcode nutrition lookup app. Scan a food barcode → get nutritional info from Open Food Facts, cached in Supabase. Computes a Clean Score (0-100) based on evidence-based longevity research.
 
 ## Stack
 
@@ -44,6 +44,13 @@ supabase db push                                    # Push new migrations
 supabase functions deploy lookup-barcode --no-verify-jwt  # Deploy Edge Function
 ```
 
+After deploying, clear cached products to force re-scoring:
+```bash
+SERVICE_KEY="<from supabase projects api-keys --project-ref zijbiydtfezbbgyikcgc>"
+curl -s -X DELETE "https://zijbiydtfezbbgyikcgc.supabase.co/rest/v1/products?barcode=neq.IMPOSSIBLE" \
+  -H "apikey: $SERVICE_KEY" -H "Authorization: Bearer $SERVICE_KEY"
+```
+
 JWT verification is disabled — no user auth yet.
 
 ## Schema
@@ -62,8 +69,27 @@ Caches successful barcode lookups from Open Food Facts.
 | proteins_100g | numeric | Per 100g |
 | carbohydrates_100g | numeric | Per 100g |
 | fat_100g | numeric | Per 100g |
-| nova_group | integer | 1=unprocessed, 4=ultra-processed |
+| saturated_fat_100g | numeric | Per 100g |
+| sugars_100g | numeric | Per 100g |
+| salt_100g | numeric | Per 100g |
+| fiber_100g | numeric | Per 100g |
+| nova_group | integer | 1-4, from OFF or estimated by `estimateNova()` |
+| nutriscore_grade | text | a-e or "unknown" |
+| nutriscore_score | integer | Numeric nutriscore |
+| ecoscore_grade | text | a-e |
 | ingredients_text | text | |
+| ingredients_count | integer | Number of ingredients |
+| additives | jsonb | Array of `{id, name}` objects e.g. `[{"id":"E412","name":"Guar gum"}]` |
+| allergens | jsonb | Array e.g. `["en:milk", "en:mustard"]` |
+| traces | jsonb | Array of trace allergens |
+| has_palm_oil | boolean | Derived from ingredients_analysis_tags |
+| has_seed_oil | boolean | Derived from ingredients list (recursive check) |
+| vegan_status | text | vegan, non-vegan, or unknown |
+| vegetarian_status | text | vegetarian, non-vegetarian, or unknown |
+| image_url | text | Full-size product image |
+| image_small_url | text | Thumbnail product image |
+| clean_score | integer | 0-100 evidence-based longevity score |
+| clean_score_breakdown | jsonb | Array of `{factor, points, maxPoints, verdict, estimated}` |
 | fetched_at | timestamptz | When data was fetched from API — used for 30-day staleness |
 | created_at | timestamptz | |
 
@@ -86,17 +112,52 @@ Tracks barcodes that Open Food Facts doesn't have. These are never cached — al
 1. Check `products` table for cached data
 2. If found and < 30 days old → return `{ source: "cache", product: {...} }`
 3. If stale or missing → call Open Food Facts API
-4. If API returns product → upsert into `products`, return `{ source: "api", product: {...} }`
-5. If API returns 404 or `status: 0` → log to `not_found_barcodes`, return `{ error: "Product not found" }` (HTTP 404)
+4. If OFF doesn't have NOVA → estimate via `estimateNova()`
+5. Resolve additive E-numbers to names via OFF taxonomy API
+6. Compute Clean Score with breakdown
+7. Upsert into `products`, return `{ source: "api", product: {...} }`
+8. If API returns 404 or `status: 0` → log to `not_found_barcodes`, return 404
 
-### Known gotcha
-Open Food Facts returns **HTTP 404** (not 200 with `status: 0`) for some missing products. The function handles both cases.
+### Clean Score (0-100)
+
+Evidence-based longevity scoring. Weights based on strength of association with all-cause/CVD mortality in large prospective cohorts.
+
+| Factor | Max Points | Threshold | Evidence |
+|--------|-----------|-----------|----------|
+| Processing (NOVA) | 35 | NOVA 1→35, 2→26, 3→14, 4→0 | Strongest single predictor of UPF mortality |
+| Sugars | 20 | Linear 0g→25g per 100g | Robust link to obesity, diabetes, CVD |
+| Salt | 20 | Linear 0g→1.5g per 100g | Clear CVD dose-response |
+| Saturated fat | 10 | Linear 0g→10g per 100g | Modest CHD/cancer associations |
+| Additives | 10 | 0→10, 1→8, 2→6, 3→4, 4→2, 5+→0 | Emerging emulsifier evidence |
+| Nutri-Score | 5 | A→5, B→3, C→2, D→1, E→0 | Validated composite sanity check |
+
+**Missing data**: gets full points (benefit of the doubt) but flagged as `estimated: true` in breakdown. The iOS app shows a note when estimated factors exist.
+
+**Hard red flags** (override score after calculation):
+- **Industrial trans fats**: ingredients containing "partially hydrogenated" → cap score at 20
+- **Processed meat + nitrites**: category match + E249/E250/E251/E252 → subtract 10
+- **Alcohol**: `alcohol_100g > 1` → cap score at 50
+
+**NOT scored** (display only): seed oils, palm oil. Evidence for independent mortality impact is weak/controversial — these are markers of UPF patterns, not villains per se.
+
+### NOVA Estimation
+
+When OFF doesn't provide NOVA, `estimateNova()` guesses based on:
+- Has additives or UPF marker words (maltodextrin, hydrogenated, etc.) → **NOVA 4**
+- Otherwise checks ingredient count and taxonomy status
+
+**Known limitation**: the current estimator is a rough heuristic. It uses OFF's `is_in_taxonomy` flag which is about OFF's data quality, not actual processing level. Needs improvement — likely a proper database mapping ingredient IDs to NOVA categories. For example, tahini (ground sesame) gets NOVA 2 when it should arguably be NOVA 1.
+
+### Known gotchas
+- Open Food Facts returns **HTTP 404** (not 200 with `status: 0`) for some missing products. The function handles both.
+- OFF sometimes parses storage instructions as ingredients (e.g. "Keep refrigerated below 5°C").
+- `additives_tags: []` (empty array) is different from `null` — empty means "confirmed no additives", null means "unknown".
+- Additive names are resolved via OFF taxonomy API (`/api/v2/taxonomy?tagtype=additives`) — adds ~200ms to first fetch.
 
 ### Logging
-All requests are logged with `console.log`/`console.warn`/`console.error` prefixed with `[lookup-barcode]`. View logs in the Supabase dashboard (CLI v2.72.7 doesn't support `functions logs`).
+All requests are logged with `console.log`/`console.warn`/`console.error` prefixed with `[lookup-barcode]`. View logs in the Supabase dashboard.
 
 ### Debugging production
-Query tables directly with service role key:
 ```bash
 SERVICE_KEY="<get from supabase projects api-keys --project-ref zijbiydtfezbbgyikcgc>"
 
@@ -119,3 +180,10 @@ curl -s -X POST 'https://zijbiydtfezbbgyikcgc.supabase.co/functions/v1/lookup-ba
 - Every table gets RLS enabled immediately
 - Seed data goes in migrations (not seed.sql)
 - Edge Functions use `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` env vars (auto-provided)
+
+## Future Work
+
+- **NOVA estimation database**: Build a proper mapping of ingredient IDs → NOVA categories instead of relying on heuristics. The current `estimateNova()` is fragile — it checks `is_in_taxonomy` which reflects OFF data quality, not actual processing level.
+- **Additive risk tiers**: Weight specific E-numbers differently (e.g. emulsifiers like E471/E407 more heavily than natural thickeners).
+- **Alternative APIs**: For products not in OFF. Will need an ingredient mapping layer when a second data source is added.
+- **User accounts**: Auth, dietary preferences, scan history.
