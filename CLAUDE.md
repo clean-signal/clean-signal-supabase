@@ -38,10 +38,18 @@ docker exec supabase_db_clean-signal-supabase psql -U postgres -c "SELECT ..."
 
 ## Deploying
 
+**CI/CD (preferred)**: Push to `main` triggers GitHub Actions (`.github/workflows/deploy.yml`). Runs migrations and deploys all edge functions automatically. Only triggers on changes to `supabase/` directory.
+
+**Required GitHub repo secrets** (set at https://github.com/clean-signal/clean-signal-supabase/settings/secrets/actions):
+- `SUPABASE_ACCESS_TOKEN` — generate at https://supabase.com/dashboard/account/tokens
+- `SUPABASE_DB_PASSWORD` — database password from project settings
+
+**Manual deploy** (fallback — requires CLI auth and direct DB access on port 5432):
 ```bash
 supabase link --project-ref zijbiydtfezbbgyikcgc
-supabase db push                                    # Push new migrations
-supabase functions deploy lookup-barcode --no-verify-jwt  # Deploy Edge Function
+supabase db push
+supabase functions deploy lookup-barcode --no-verify-jwt
+supabase functions deploy lookup-ingredient --no-verify-jwt
 ```
 
 After deploying, clear cached products to force re-scoring:
