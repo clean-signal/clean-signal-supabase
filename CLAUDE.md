@@ -132,6 +132,18 @@ Junction table linking products to ingredients. Replaced on each API fetch (dele
 | parent_ingredient_id | text FK → ingredients | null = top-level ingredient |
 | depth | integer | 0 = top-level, 1 = sub-ingredient, etc. |
 
+### Ingredient hierarchy design decision
+
+All depths are stored and returned to the client as a flat list. The iOS app displays all ingredients (depth 0, 1, 2, etc.) as equal pills — no nesting in the UI. Rationale: top-level ingredients are often generic category words ("colour", "thickener", "acid") while the actual additives and chemicals that matter for risk scoring are sub-ingredients (e.g. "e150d" under "colour", "guar gum" under "thickener"). Hiding sub-ingredients would hide the most important information. The `depth` and `parent_ingredient_id` fields are preserved in the DB for potential future use but the client treats all ingredients equally.
+
+## Edge Function: lookup-ingredient
+
+**Endpoint**: `POST /functions/v1/lookup-ingredient`
+**Body**: `{ "ingredient_id": "en:e412" }`
+**Response**: `{ ingredient: {...}, products: [...] }`
+
+Returns the full ingredient record plus all products containing it (barcode, name, brand, score, thumbnail). Used by the iOS ingredient detail page.
+
 ## Edge Function: lookup-barcode
 
 **Endpoint**: `POST /functions/v1/lookup-barcode`
