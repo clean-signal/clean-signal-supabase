@@ -103,6 +103,35 @@ Tracks barcodes that Open Food Facts doesn't have. These are never cached — al
 | first_scanned_at | timestamptz | |
 | last_scanned_at | timestamptz | |
 
+### ingredients
+Reference table for every unique ingredient encountered from OFF scans. Auto-populated on each API fetch. Curated fields (`risk_tier`, `risk_reason`, `description`) are never overwritten by the edge function.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | text PK | OFF taxonomy ID e.g. `en:wheat-flour`, `en:e322` |
+| name | text | Display name from OFF |
+| type | text | `ingredient`, `additive`, or `vitamin` (heuristic) |
+| risk_tier | text | `red`, `caution`, `positive`, or null (curated) |
+| risk_reason | text | Explanation for risk tier (curated) |
+| vegan | text | yes/no/maybe from OFF |
+| vegetarian | text | yes/no/maybe from OFF |
+| description | text | For ingredient pages (curated) |
+| product_count | integer | Maintained by trigger — distinct products containing this |
+| created_at | timestamptz | |
+| updated_at | timestamptz | |
+
+### product_ingredients
+Junction table linking products to ingredients. Replaced on each API fetch (delete + insert). PK is `(barcode, position)` not `(barcode, ingredient_id)` because the same ingredient can appear twice in one product (e.g. wheat flour as regular + wholemeal).
+
+| Column | Type | Notes |
+|--------|------|-------|
+| barcode | text FK → products | ON DELETE CASCADE |
+| ingredient_id | text FK → ingredients | |
+| position | integer | 1-based order in ingredient list |
+| percent_estimate | numeric | From OFF, nullable |
+| parent_ingredient_id | text FK → ingredients | null = top-level ingredient |
+| depth | integer | 0 = top-level, 1 = sub-ingredient, etc. |
+
 ## Edge Function: lookup-barcode
 
 **Endpoint**: `POST /functions/v1/lookup-barcode`
@@ -115,8 +144,10 @@ Tracks barcodes that Open Food Facts doesn't have. These are never cached — al
 4. If OFF doesn't have NOVA → estimate via `estimateNova()`
 5. Resolve additive E-numbers to names via OFF taxonomy API
 6. Compute Clean Score with breakdown
-7. Upsert into `products`, return `{ source: "api", product: {...} }`
-8. If API returns 404 or `status: 0` → log to `not_found_barcodes`, return 404
+7. Upsert into `products`
+8. Process ingredients: flatten tree → upsert into `ingredients` → replace `product_ingredients` rows (non-blocking, wrapped in try/catch)
+9. Return `{ source: "api", product: {...} }`
+10. If API returns 404 or `status: 0` → log to `not_found_barcodes`, return 404
 
 ### Clean Score (0-100)
 

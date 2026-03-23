@@ -270,12 +270,174 @@ function computeCleanScore(product: {
   return { score, breakdown };
 }
 
+// --- Ingredient DB helpers ---
+
+const VITAMIN_MINERAL_PATTERNS = [
+  "vitamin", "iron", "zinc", "calcium", "magnesium", "folic-acid", "niacin",
+  "riboflavin", "thiamin", "biotin", "pantothenic", "selenium", "iodine",
+  "potassium", "phosphorus", "manganese", "copper", "chromium", "molybdenum",
+];
+
+function deriveIngredientType(id: string, additivesTags: Set<string>): string {
+  if (additivesTags.has(id)) return "additive";
+  if (/^en:e\d{3}/.test(id)) return "additive";
+  if (VITAMIN_MINERAL_PATTERNS.some((p) => id.includes(p))) return "vitamin";
+  return "ingredient";
+}
+
+interface FlatIngredient {
+  id: string;
+  text: string;
+  percent_estimate: number | null;
+  vegan: string | null;
+  vegetarian: string | null;
+  parent_id: string | null;
+  depth: number;
+}
+
+function flattenIngredientTree(
+  ingredients: any[],
+  parentId: string | null = null,
+  depth: number = 0,
+): FlatIngredient[] {
+  const result: FlatIngredient[] = [];
+  for (const ing of ingredients) {
+    if (!ing.id) continue;
+    result.push({
+      id: ing.id,
+      text: ing.text || ing.id.replace(/^en:/, "").replace(/-/g, " "),
+      percent_estimate: ing.percent_estimate ?? null,
+      vegan: ing.vegan ?? null,
+      vegetarian: ing.vegetarian ?? null,
+      parent_id: parentId,
+      depth,
+    });
+    if (Array.isArray(ing.ingredients)) {
+      result.push(...flattenIngredientTree(ing.ingredients, ing.id, depth + 1));
+    }
+  }
+  return result;
+}
+
+async function processIngredients(
+  supabase: any,
+  barcode: string,
+  ingredients: any[],
+  additivesTags: string[],
+): Promise<void> {
+  if (!ingredients || ingredients.length === 0) return;
+
+  const additivesSet = new Set(additivesTags || []);
+  const flat = flattenIngredientTree(ingredients);
+  if (flat.length === 0) return;
+
+  // 1. Upsert unique ingredients into reference table
+  const uniqueIngredients = new Map<string, FlatIngredient>();
+  for (const ing of flat) {
+    if (!uniqueIngredients.has(ing.id)) {
+      uniqueIngredients.set(ing.id, ing);
+    }
+  }
+
+  const ingredientRows = Array.from(uniqueIngredients.values()).map((ing) => ({
+    id: ing.id,
+    name: ing.text,
+    type: deriveIngredientType(ing.id, additivesSet),
+    vegan: ing.vegan,
+    vegetarian: ing.vegetarian,
+    updated_at: new Date().toISOString(),
+  }));
+
+  const { error: ingError } = await supabase
+    .from("ingredients")
+    .upsert(ingredientRows, { onConflict: "id", ignoreDuplicates: false });
+
+  if (ingError) {
+    console.error("[lookup-barcode] ingredients upsert error:", ingError);
+    return;
+  }
+
+  // 2. Delete old product_ingredients for this barcode (trigger decrements counts)
+  const { error: delError } = await supabase
+    .from("product_ingredients")
+    .delete()
+    .eq("barcode", barcode);
+
+  if (delError) {
+    console.error("[lookup-barcode] product_ingredients delete error:", delError);
+    return;
+  }
+
+  // 3. Insert new product_ingredients (trigger increments counts)
+  const piRows = flat.map((ing, idx) => ({
+    barcode,
+    ingredient_id: ing.id,
+    position: idx + 1,
+    percent_estimate: ing.percent_estimate,
+    parent_ingredient_id: ing.parent_id,
+    depth: ing.depth,
+  }));
+
+  const { error: piError } = await supabase
+    .from("product_ingredients")
+    .insert(piRows);
+
+  if (piError) {
+    console.error("[lookup-barcode] product_ingredients insert error:", piError);
+    return;
+  }
+
+  // 4. Refresh product_count for affected ingredients via RPC
+  const ingredientIds = [...new Set(flat.map((ing) => ing.id))];
+  const { error: rpcError } = await supabase.rpc("refresh_ingredient_counts", {
+    ingredient_ids: ingredientIds,
+  });
+  if (rpcError) {
+    console.error("[lookup-barcode] refresh_ingredient_counts error:", rpcError);
+  }
+}
+
 /** Derive vegan/vegetarian status from ingredients_analysis_tags. */
 function deriveStatus(tags: string[] | undefined, positive: string, negative: string): string {
   if (!Array.isArray(tags)) return "unknown";
   if (tags.includes(negative)) return negative.replace("en:", "");
   if (tags.includes(positive)) return positive.replace("en:", "");
   return "unknown";
+}
+
+/** Fetch structured ingredients for a barcode (joined with ingredient metadata). */
+async function fetchStructuredIngredients(supabase: any, barcode: string) {
+  // Get product_ingredients for this barcode
+  const { data: piRows, error: piError } = await supabase
+    .from("product_ingredients")
+    .select("ingredient_id, position, percent_estimate, depth, parent_ingredient_id")
+    .eq("barcode", barcode)
+    .order("position");
+
+  if (piError || !piRows || piRows.length === 0) return [];
+
+  // Get ingredient metadata for all referenced IDs
+  const ingredientIds = [...new Set(piRows.map((r: any) => r.ingredient_id))];
+  const { data: ingredients } = await supabase
+    .from("ingredients")
+    .select("id, name, type, risk_tier")
+    .in("id", ingredientIds);
+
+  const ingMap = new Map((ingredients || []).map((i: any) => [i.id, i]));
+
+  return piRows.map((row: any) => {
+    const ing = ingMap.get(row.ingredient_id);
+    return {
+      id: row.ingredient_id,
+      name: ing?.name ?? row.ingredient_id,
+      type: ing?.type ?? "ingredient",
+      risk_tier: ing?.risk_tier ?? null,
+      percent_estimate: row.percent_estimate,
+      position: row.position,
+      depth: row.depth,
+      parent_id: row.parent_ingredient_id,
+    };
+  });
 }
 
 Deno.serve(async (req) => {
@@ -317,8 +479,9 @@ Deno.serve(async (req) => {
 
       if (ageDays < STALE_DAYS) {
         console.log(`[lookup-barcode] Cache HIT for ${barcode} — "${cached.product_name}" (age: ${ageDays.toFixed(1)} days)`);
+        const structured_ingredients = await fetchStructuredIngredients(supabase, barcode);
         return new Response(
-          JSON.stringify({ source: "cache", product: cached }),
+          JSON.stringify({ source: "cache", product: cached, structured_ingredients }),
           { headers: { ...corsHeaders, "Content-Type": "application/json" } },
         );
       }
@@ -452,10 +615,19 @@ Deno.serve(async (req) => {
       console.error("Upsert error:", upsertError);
     }
 
+    // Process ingredients into normalized tables
+    try {
+      await processIngredients(supabase, barcode, ingredients, p.additives_tags || []);
+    } catch (err) {
+      console.error("[lookup-barcode] ingredient processing error:", err);
+    }
+
     console.log(`[lookup-barcode] API fetch for ${barcode} — "${product.product_name}" by "${product.brand}"`);
 
+    const structured_ingredients = await fetchStructuredIngredients(supabase, barcode);
+
     return new Response(
-      JSON.stringify({ source: "api", product }),
+      JSON.stringify({ source: "api", product, structured_ingredients }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" } },
     );
   } catch (err) {
