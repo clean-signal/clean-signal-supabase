@@ -23,13 +23,13 @@ const corsHeaders = {
 
 /**
  * Estimate NOVA group when OFF doesn't provide one.
- * Simple heuristic — can be refined over time.
+ * Simple heuristic — needs a proper ingredient→NOVA database long term.
  *
  * Logic:
- *   - Has additives (E-numbers) → NOVA 4 (ultra-processed)
- *   - Has many ingredients (>5) and some not in taxonomy → NOVA 3 (processed)
- *   - Few ingredients (≤5), all recognizable → NOVA 1 (unprocessed)
- *   - Otherwise → NOVA 2 (processed ingredient)
+ *   - Has additives or UPF marker words → NOVA 4
+ *   - ≤3 ingredients, no additives → NOVA 1 (simple whole food)
+ *   - >5 ingredients → NOVA 3 (processed food)
+ *   - Otherwise → NOVA 2 (processed culinary ingredient)
  */
 function estimateNova(product: {
   additives_tags: string[] | null;
@@ -39,10 +39,9 @@ function estimateNova(product: {
 }): number {
   const addCount = product.additives_tags?.length ?? 0;
   const ingCount = product.ingredients_n ?? 0;
-  const ingredients = product.ingredients || [];
   const ingText = (product.ingredients_text || "").toLowerCase();
 
-  // NOVA 4 indicators: has additives, or contains UPF marker ingredients
+  // NOVA 4: has additives or UPF marker ingredients
   if (addCount > 0) return 4;
 
   const upfMarkers = [
@@ -52,16 +51,13 @@ function estimateNova(product: {
   ];
   if (upfMarkers.some((m) => ingText.includes(m))) return 4;
 
-  // NOVA 1: very few ingredients, all in taxonomy (whole foods)
-  if (ingCount <= 3 && ingredients.length > 0) {
-    const allInTaxonomy = ingredients.every((i) => i.is_in_taxonomy === 1);
-    if (allInTaxonomy) return 1;
-  }
+  // NOVA 1: few ingredients, no additives, no UPF markers → simple whole food
+  if (ingCount <= 3) return 1;
 
-  // NOVA 3: more than 5 ingredients, suggesting processed food
+  // NOVA 3: many ingredients suggests a processed food product
   if (ingCount > 5) return 3;
 
-  // NOVA 2: simple processed ingredient (oil, sugar, flour, etc.)
+  // NOVA 2: 4-5 ingredients, no additives — likely a simple processed ingredient
   return 2;
 }
 
