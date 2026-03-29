@@ -303,17 +303,27 @@ function flattenIngredientTree(
   const result: FlatIngredient[] = [];
   for (const ing of ingredients) {
     if (!ing.id) continue;
-    result.push({
-      id: ing.id,
-      text: ing.text || ing.id.replace(/^en:/, "").replace(/-/g, " "),
-      percent_estimate: ing.percent_estimate ?? null,
-      vegan: ing.vegan ?? null,
-      vegetarian: ing.vegetarian ?? null,
-      parent_id: parentId,
-      depth,
-    });
+    // Only ingest ingredients that OFF has in its taxonomy — skip garbage
+    // (multilingual packaging text, recycling instructions, etc.)
+    const inTaxonomy = ing.is_in_taxonomy === 1;
+    if (inTaxonomy) {
+      result.push({
+        id: ing.id,
+        text: ing.text || ing.id.replace(/^en:/, "").replace(/-/g, " "),
+        percent_estimate: ing.percent_estimate ?? null,
+        vegan: ing.vegan ?? null,
+        vegetarian: ing.vegetarian ?? null,
+        parent_id: inTaxonomy ? parentId : null,
+        depth: inTaxonomy ? depth : 0,
+      });
+    }
+    // Always recurse — non-taxonomy parents can have taxonomy children
     if (Array.isArray(ing.ingredients)) {
-      result.push(...flattenIngredientTree(ing.ingredients, ing.id, depth + 1));
+      result.push(...flattenIngredientTree(
+        ing.ingredients,
+        inTaxonomy ? ing.id : parentId,
+        inTaxonomy ? depth + 1 : depth,
+      ));
     }
   }
   return result;
